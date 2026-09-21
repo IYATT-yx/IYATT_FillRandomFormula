@@ -459,8 +459,13 @@ class ContinuousFillWindow:
         numFormat = "0" if decimals == 0 else "0." + "0" * decimals
 
         # 批量应用到选定的目标区域
-        self._destRng.Formula = formulaStr
-        self._destRng.NumberFormatLocal = numFormat
+        try:
+            for area in self._destRng.Areas:
+                area.Formula = formulaStr
+                area.NumberFormatLocal = numFormat
+        except Exception:
+            self._destRng.Formula = formulaStr
+            self._destRng.NumberFormatLocal = numFormat
 
         try:
             hwnd = self._app.Hwnd
