@@ -25,8 +25,8 @@ ENTER_INTERVAL = 500  # 连续填充间隔（毫秒）
 pluginInfo = {
     'name': 'FillRandomFormula',
     'author': 'IYATT',
-    'description': '解析或手动调整规格，生成带边界缩减与自定义步长的动态随机公式',
-    'version': '0.0.1',
+    'description': '尺寸报告随机公式填充',
+    'version': '0.0.2',
 }
 
 
