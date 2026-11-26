@@ -19,14 +19,23 @@ GetAsyncKeyState = user32.GetAsyncKeyState
 GetAsyncKeyState.argtypes = [ctypes.c_int]
 GetAsyncKeyState.restype = wintypes.SHORT
 
-VK_RETURN = 0x0D  # 回车键
-ENTER_INTERVAL = 500  # 连续填充间隔（毫秒）
+GetForegroundWindow = user32.GetForegroundWindow
+GetForegroundWindow.restype = wintypes.HWND
+
+GetWindowThreadProcessId = user32.GetWindowThreadProcessId
+GetWindowThreadProcessId.argtypes = [wintypes.HWND, wintypes.LPDWORD]
+GetWindowThreadProcessId.restype = wintypes.DWORD
+
+VK_CONTROL = 0x11
+VK_SHIFT = 0x10
+VK_Q = 0x51
+VK_E = 0x45
 
 pluginInfo = {
     'name': 'FillRandomFormula',
     'author': 'IYATT',
     'description': '尺寸报告随机公式填充',
-    'version': '0.0.2',
+    'version': '0.0.3',
 }
 
 
@@ -93,9 +102,17 @@ class ContinuousFillWindow:
         self._destRng = None
 
         self._isListening = False
-        self._lastEnterState = False
         self._afterId = None
-        self._singleEnterTimer = None
+
+        self._excelHwnd = 0
+        self._excelPid = 0
+        try:
+            self._excelHwnd = int(self._app.Hwnd)
+            pid = wintypes.DWORD()
+            GetWindowThreadProcessId(self._excelHwnd, ctypes.byref(pid))
+            self._excelPid = int(pid.value)
+        except Exception:
+            pass
 
         self._origMoveAfterReturn = True
         try:
@@ -118,7 +135,7 @@ class ContinuousFillWindow:
         # 1. 顶部提示
         lblTip = ttk.Label(
             self._root,
-            text="快捷操作：在 Excel 中选好单元格单击【回车】自动录入到源，快速双击录入到目标。\n识别公差后可手动修改名义值或偏差，步长支持下拉选择或直接手动输入任意数值。",
+            text="快捷操作：在 Excel 中选好单元格按【Ctrl+Shift+Q】自动录入到源，按【Ctrl+Shift+E】录入到目标。",
             justify="left",
             wraplength=500,
             font=("Microsoft YaHei", 9)
@@ -164,12 +181,12 @@ class ContinuousFillWindow:
         # 策略参数
         ttk.Label(frameCalc, text="上限收缩(%):").grid(row=0, column=0, sticky="w", pady=3)
         self.ent_upper_gap = ttk.Entry(frameCalc, width=8)
-        self.ent_upper_gap.insert(0, "30")
+        self.ent_upper_gap.insert(0, "1")
         self.ent_upper_gap.grid(row=0, column=1, sticky="w", pady=3)
 
         ttk.Label(frameCalc, text="下限收缩(%):").grid(row=0, column=2, sticky="w", pady=3, padx=(12, 0))
         self.ent_lower_gap = ttk.Entry(frameCalc, width=8)
-        self.ent_lower_gap.insert(0, "20")
+        self.ent_lower_gap.insert(0, "1")
         self.ent_lower_gap.grid(row=0, column=3, sticky="w", pady=3)
 
         ttk.Label(frameCalc, text="步长精度:").grid(row=0, column=4, sticky="w", pady=3, padx=(12, 0))
@@ -218,11 +235,27 @@ class ContinuousFillWindow:
         btnExit = ttk.Button(frameBottom, text="退出 (Esc)", command=self._closeWindow)
         btnExit.pack(side="right", padx=5)
 
-    def _bindEvents(self):
-        # 焦点监听，判断 Enter 键填充到哪个文本框
-        self.ent_src.bind("<FocusIn>", lambda e: self._setActiveFocus("source"))
-        self.ent_dest.bind("<FocusIn>", lambda e: self._setActiveFocus("target"))
+    def _isKeyDown(self, vkCode: int) -> bool:
+        return bool(GetAsyncKeyState(vkCode) & 0x8000)
 
+    def _isExcelForeground(self) -> bool:
+        """判断当前前台窗口是否属于 Excel（匹配主窗口句柄或同一进程）"""
+        fgHwnd = GetForegroundWindow()
+        if not fgHwnd:
+            return False
+
+        if self._excelHwnd and int(fgHwnd) == self._excelHwnd:
+            return True
+
+        if self._excelPid:
+            fgPid = wintypes.DWORD()
+            GetWindowThreadProcessId(fgHwnd, ctypes.byref(fgPid))
+            if int(fgPid.value) == self._excelPid:
+                return True
+
+        return False
+
+    def _bindEvents(self):
         # 任意参数（包含步长编辑框）在键盘敲击释放时均重新计算
         for ent in [self.ent_nominal, self.ent_upper_dev, self.ent_lower_dev, self.ent_upper_gap, self.ent_lower_gap, self.cbo_step]:
             ent.bind("<KeyRelease>", lambda e: self._recalculateAll())
@@ -236,18 +269,14 @@ class ContinuousFillWindow:
 
     def _startListening(self):
         self._isListening = True
-        try:
-            self._app.MoveAfterReturn = False
-        except Exception:
-            pass
-        self._pollEnterKey()
+        self._lastSrcCombo = False
+        self._lastDestCombo = False
+        self._pollHotkeys()
 
     def _stopListening(self):
         self._isListening = False
-        try:
-            self._app.MoveAfterReturn = self._origMoveAfterReturn
-        except Exception:
-            pass
+        self._lastSrcCombo = False
+        self._lastDestCombo = False
 
         if self._afterId and self._root:
             try:
@@ -256,15 +285,7 @@ class ContinuousFillWindow:
                 pass
             self._afterId = None
 
-        # 新增：清理回车定时器
-        if self._singleEnterTimer and self._root:
-            try:
-                self._root.after_cancel(self._singleEnterTimer)
-            except Exception:
-                pass
-            self._singleEnterTimer = None
-
-    def _pollEnterKey(self):
+    def _pollHotkeys(self):
         if not self._isListening:
             return
 
@@ -273,36 +294,36 @@ class ContinuousFillWindow:
                 self._isListening = False
                 return
 
-            state = GetAsyncKeyState(VK_RETURN)
-            isPressed = bool(state & 0x8000)
+            if self._isExcelForeground():
+                ctrlShiftDown = self._isKeyDown(VK_CONTROL) and self._isKeyDown(VK_SHIFT)
 
-            if isPressed and not self._lastEnterState:
-                if self._singleEnterTimer is not None:
-                    self._root.after_cancel(self._singleEnterTimer)
-                    self._singleEnterTimer = None
+                # 左手单手：Ctrl + Shift + Q -> 识别源规格单元格
+                srcComboDown = ctrlShiftDown and self._isKeyDown(VK_Q)
+                if srcComboDown and not self._lastSrcCombo:
+                    self._parseSourceCell()
+                self._lastSrcCombo = srcComboDown
+
+                # 左手单手：Ctrl + Shift + E -> 提取目标填充区域
+                destComboDown = ctrlShiftDown and self._isKeyDown(VK_E)
+                if destComboDown and not self._lastDestCombo:
                     self._captureDestRange()
-                else:
-                    self._singleEnterTimer = self._root.after(ENTER_INTERVAL, self._handleSingleEnterTimeout)
-
-            self._lastEnterState = isPressed
+                self._lastDestCombo = destComboDown
+            else:
+                self._lastSrcCombo = False
+                self._lastDestCombo = False
 
         except Exception as e:
             if isinstance(e, tk.TclError):
                 self._isListening = False
                 return
-            self._logger.error(f"按键检测异常: {e}")
+            self._logger.error(f"快捷键检测异常: {e}")
 
         if self._isListening and self._root:
             try:
                 if self._root.winfo_exists():
-                    self._afterId = self._root.after(30, self._pollEnterKey)
+                    self._afterId = self._root.after(30, self._pollHotkeys)
             except tk.TclError:
                 self._isListening = False
-
-    def _handleSingleEnterTimeout(self):
-        """超时未按第二下，执行单次 Enter 逻辑：选择源规格单元格"""
-        self._singleEnterTimer = None
-        self._parseSourceCell()
 
     def _parseSourceCell(self):
         """选中单元格并自动解析填充名义值、上公差、下公差（校验只允许单选，合并的单元格算1个）"""
@@ -428,13 +449,17 @@ class ContinuousFillWindow:
             uGap = float(self.ent_upper_gap.get().strip()) / 100.0
             lGap = float(self.ent_lower_gap.get().strip()) / 100.0
             
-            # 兼容解析手动输入的步长（如 0.003 或 0.025）
             stepStr = self.cbo_step.get().strip()
             stepVal = float(stepStr)
-            if stepVal <= 0:
-                raise ValueError("步长必须大于0")
         except ValueError:
-            messagebox.showerror("错误", "参数输入有误，请确保名义值、公差、收缩比例和步长均为有效的正数！", parent=self._root)
+            messagebox.showerror("错误", "输入有误！请确保名义值、公差、步长、收缩比例为有效数字。", parent=self._root)
+            return
+
+        if stepVal <= 0:
+            messagebox.showerror("错误", "步长必须大于0！", parent=self._root)
+            return
+        if uGap < 0 or lGap < 0 or uGap > 1 or lGap > 1 or uGap + lGap >= 1:
+            messagebox.showerror("错误", "收缩比例必须位于0~100之间，且两者之和不能≥100！", parent=self._root)
             return
 
         # 理论极限
@@ -493,7 +518,6 @@ class ContinuousFillWindow:
             raise e
         finally:
             self._stopListening()
-
 
 def run(appComHandle, logQueue):
     logger = logging.getLogger(pluginInfo['name'])
